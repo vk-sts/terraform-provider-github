@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,10 +18,16 @@ func resourceGithubActionsSecret() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceGithubActionsSecretCreateOrUpdate,
 		Read:   resourceGithubActionsSecretRead,
+		Update: resourceGithubActionsSecretCreateOrUpdate,
 		Delete: resourceGithubActionsSecretDelete,
 		Importer: &schema.ResourceImporter{
 			State: resourceGithubActionsSecretImport,
 		},
+
+		// Schema migration added to handle the addition of destroy_on_drift field
+		// Resources created before this field was added need it populated with default value
+		SchemaVersion: 1,
+		MigrateState:  resourceGithubActionsSecretMigrateState,
 
 		Schema: map[string]*schema.Schema{
 			"repository": {
@@ -62,11 +69,17 @@ func resourceGithubActionsSecret() *schema.Resource {
 				Computed:    true,
 				Description: "Date of 'actions_secret' update.",
 			},
+			"destroy_on_drift": {
+				Type:        schema.TypeBool,
+				Default:     true,
+				Optional:    true,
+				Description: "Boolean indicating whether to recreate the secret if it's modified outside of Terraform. When `true` (default), Terraform will delete and recreate the secret if it detects external changes. When `false`, Terraform will acknowledge external changes but not recreate the secret.",
+			},
 		},
 	}
 }
 
-func resourceGithubActionsSecretCreateOrUpdate(d *schema.ResourceData, meta interface{}) error {
+func resourceGithubActionsSecretCreateOrUpdate(d *schema.ResourceData, meta any) error {
 	client := meta.(*Owner).v3client
 	owner := meta.(*Owner).name
 	ctx := context.Background()
@@ -107,7 +120,7 @@ func resourceGithubActionsSecretCreateOrUpdate(d *schema.ResourceData, meta inte
 	return resourceGithubActionsSecretRead(d, meta)
 }
 
-func resourceGithubActionsSecretRead(d *schema.ResourceData, meta interface{}) error {
+func resourceGithubActionsSecretRead(d *schema.ResourceData, meta any) error {
 	client := meta.(*Owner).v3client
 	owner := meta.(*Owner).name
 	ctx := context.Background()
@@ -119,7 +132,8 @@ func resourceGithubActionsSecretRead(d *schema.ResourceData, meta interface{}) e
 
 	secret, _, err := client.Actions.GetRepoSecret(ctx, owner, repoName, secretName)
 	if err != nil {
-		if ghErr, ok := err.(*github.ErrorResponse); ok {
+		ghErr := &github.ErrorResponse{}
+		if errors.As(err, &ghErr) {
 			if ghErr.Response.StatusCode == http.StatusNotFound {
 				log.Printf("[INFO] Removing actions secret %s from state because it no longer exists in GitHub",
 					d.Id())
@@ -155,19 +169,21 @@ func resourceGithubActionsSecretRead(d *schema.ResourceData, meta interface{}) e
 	// The only solution to enforce consistency between is to mark the resource
 	// as deleted (unset the ID) in order to fix potential drift by recreating
 	// the resource.
-	if updatedAt, ok := d.GetOk("updated_at"); ok && updatedAt != secret.UpdatedAt.String() {
+	destroyOnDrift := d.Get("destroy_on_drift").(bool)
+	if updatedAt, ok := d.GetOk("updated_at"); ok && destroyOnDrift && updatedAt != secret.UpdatedAt.String() {
 		log.Printf("[INFO] The secret %s has been externally updated in GitHub", d.Id())
 		d.SetId("")
-	} else if !ok {
-		if err = d.Set("updated_at", secret.UpdatedAt.String()); err != nil {
-			return err
-		}
+	}
+
+	// Always update the timestamp to prevent repeated drift detection
+	if err = d.Set("updated_at", secret.UpdatedAt.String()); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func resourceGithubActionsSecretDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceGithubActionsSecretDelete(d *schema.ResourceData, meta any) error {
 	client := meta.(*Owner).v3client
 	orgName := meta.(*Owner).name
 	ctx := context.WithValue(context.Background(), ctxId, d.Id())
@@ -182,7 +198,7 @@ func resourceGithubActionsSecretDelete(d *schema.ResourceData, meta interface{})
 	return err
 }
 
-func resourceGithubActionsSecretImport(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
+func resourceGithubActionsSecretImport(d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
 	client := meta.(*Owner).v3client
 	owner := meta.(*Owner).name
 	ctx := context.Background()
@@ -223,7 +239,7 @@ func resourceGithubActionsSecretImport(d *schema.ResourceData, meta interface{})
 	return []*schema.ResourceData{d}, nil
 }
 
-func getPublicKeyDetails(owner, repository string, meta interface{}) (keyId, pkValue string, err error) {
+func getPublicKeyDetails(owner, repository string, meta any) (keyId, pkValue string, err error) {
 	client := meta.(*Owner).v3client
 	ctx := context.Background()
 
